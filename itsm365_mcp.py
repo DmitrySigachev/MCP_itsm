@@ -97,6 +97,19 @@ def _text(html_text) -> str:
     return re.sub(r"\n\s*\n+", "\n", html.unescape(re.sub(r"<[^>]+>", "", s))).strip()
 
 
+_BAD_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_RESERVED_FILENAMES = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)),
+                       *(f"LPT{i}" for i in range(1, 10))}
+
+
+def _safe_filename(name: str, fallback: str) -> str:
+    """Имя файла, допустимое в Windows, macOS и Linux: запрещённые символы и разделители пути -> "_"."""
+    name = _BAD_FILENAME_CHARS.sub("_", name).strip().rstrip(". ")
+    if name.split(".")[0].strip().upper() in _RESERVED_FILENAMES:
+        name = "_" + name
+    return name or fallback
+
+
 def _op(method: str, *args) -> dict:
     return {"method": method, "params": {"args": list(args)}}
 
@@ -230,7 +243,10 @@ def open_tickets(object_codes: list[str] | None = None, team_uuids: list[str] | 
 def download_ticket_files(number: int, max_mb: int = 50) -> dict:
     """Скачать вложения заявки на диск в папку <files_dir>/<номер заявки>/.
 
-    Берутся файлы заявки и картинки, вставленные в текст комментариев. Файлы больше max_mb МБ пропускаются.
+    Берутся файлы заявки, файлы, прикреплённые к комментариям (оригиналы картинок), и картинки,
+    вставленные в текст комментариев (обычно уменьшенные копии). Файлы больше max_mb МБ пропускаются.
+    Вложение комментария, продублированное на заявке (то же имя и размер), скачивается один раз.
+    Символы, недопустимые в именах файлов Windows, заменяются на "_".
     files_dir - параметр config.ini (секция [itsm365]) или ITSM365_FILES_DIR; по умолчанию ../method_api.
     Ответ: folder - папка, saved / skipped / errors - списки файлов.
     """
@@ -239,9 +255,21 @@ def download_ticket_files(number: int, max_mb: int = 50) -> dict:
     if len(tickets) != 1:
         raise ToolError(f"Заявка {number}: найдено {len(tickets)}")
     ticket = tickets[0]["UUID"]
-    files = {f["UUID"]: f for f in rpc("find", {"fqn": "file", "query": {"source": ticket},
-                                                "view": ["UUID", "title", "fileSize"]}) or []}
-    for c in rpc("find", {"fqn": "comment", "query": {"source": ticket}, "view": ["UUID", "text"]}) or []:
+    comments = rpc("find", {"fqn": "comment", "query": {"source": ticket}, "view": ["UUID", "text"]}) or []
+    # Файлы ищутся и у заявки, и у её комментариев: вложение комментария имеет source = comment$...
+    sources = [ticket] + [c["UUID"] for c in comments]
+    found = []
+    for i in range(0, len(sources), 100):
+        found += rpc("find", {"fqn": "file", "query": {"source": _op("in", *sources[i:i + 100])},
+                              "view": ["UUID", "title", "fileSize", "source"]}) or []
+    # Сначала файлы заявки, затем файлы комментариев, которых на заявке нет (сравнение по имени и размеру)
+    files, seen = {}, set()
+    for f in sorted(found, key=lambda f: f.get("source") != ticket):
+        key = (f.get("title"), f.get("fileSize"))
+        if f.get("source") == ticket or key not in seen:
+            files[f["UUID"]] = f
+        seen.add(key)
+    for c in comments:
         for uuid in re.findall(r"file\$\d+", c.get("text") or ""):
             files.setdefault(uuid, {"UUID": uuid, "title": f"comment_{uuid.split('$')[1]}.png"})
 
@@ -252,10 +280,10 @@ def download_ticket_files(number: int, max_mb: int = 50) -> dict:
 
     saved, skipped, errors, names = [], [], [], set()
     for uuid, f in files.items():
-        name = os.path.basename(f.get("title") or uuid) or uuid
-        if name in names:
+        name = _safe_filename(f.get("title") or "", uuid.replace("$", "_"))
+        if name.lower() in names:  # в Windows имена файлов регистронезависимы
             name = f"{uuid.split('$')[1]}_{name}"
-        names.add(name)
+        names.add(name.lower())
         size = f.get("fileSize") or 0
         if size > max_mb * 1024 * 1024:
             skipped.append({"file": name, "size": size, "reason": f"больше {max_mb} МБ"})
